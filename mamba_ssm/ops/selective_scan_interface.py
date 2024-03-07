@@ -312,7 +312,7 @@ def mamba_inner_ref(
     xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
     out_proj_weight, out_proj_bias,
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-    C_proj_bias=None, delta_softplus=True
+    C_proj_bias=None, delta_softplus=True, ssm_ref: bool = False,
 ):
     L = xz.shape[-1]
     delta_rank = delta_proj_weight.shape[1]
@@ -341,5 +341,8 @@ def mamba_inner_ref(
             C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
         else:
             C = rearrange(C, "(b l) (dstate two) -> b dstate (l two)", l=L, two=2).contiguous()
-    y = selective_scan_fn(x, delta, A, B, C, D, z=z, delta_bias=delta_bias, delta_softplus=True)
+    if ssm_ref:
+        y = selective_scan_ref(x, delta, A, B, C, D, z=z, delta_bias=delta_bias, delta_softplus=True)
+    else:
+        y = selective_scan_fn(x, delta, A, B, C, D, z=z, delta_bias=delta_bias, delta_softplus=True)
     return F.linear(rearrange(y, "b d l -> b l d"), out_proj_weight, out_proj_bias)
