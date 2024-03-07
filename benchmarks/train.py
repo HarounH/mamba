@@ -8,6 +8,7 @@ import random
 import datetime
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, MambaConfig
+from mamba_ssm.ops.selective_scan_interface import mamba_inner_ref, rearrange
 import torch.nn.functional as F
 from timeit import default_timer as timer
 
@@ -205,9 +206,9 @@ def main(args) -> None:
     elif args.model == "mampa":
         # TODO: specify model parallelism in this cls name.
         raise NotImplementedError("TODO")
-        pass
+
     model = MambaLMHeadModel(
-        config=MambaConfig(vocab_size=args.vocab_size, n_layer=n_layer),
+        config=MambaConfig(vocab_size=args.vocab_size, n_layer=n_layer, d_model=1024),
         device="cuda",
         dtype=torch.bfloat16,
         mamba_cls=mamba_cls,
