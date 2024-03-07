@@ -204,12 +204,13 @@ def main(args) -> None:
         mamba_cls = MambaRef
     elif args.model == "mampa":
         # TODO: specify model parallelism in this cls name.
-        mamba_cls = Mampa
+        raise NotImplementedError("TODO")
+        pass
     model = MambaLMHeadModel(
         config=MambaConfig(vocab_size=args.vocab_size, n_layer=n_layer),
         device="cuda",
         dtype=torch.bfloat16,
-        mamba_cls=
+        mamba_cls=mamba_cls,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     for step in range(0, max_iter):
