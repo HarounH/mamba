@@ -422,7 +422,9 @@ def main(args) -> None:
     elif args.model == "ref":
         mamba_cls = MambaRef
     elif args.model == "mampa":
-        mamba_cls = Mampa
+        print(f"creating mampa with mp={get_world_size()}")
+        import functools
+        mamba_cls = functools.partial(Mampa, parallelism_size=get_world_size())
 
     model = MambaLMHeadModel(
         config=MambaConfig(vocab_size=args.vocab_size, n_layer=n_layer, d_model=1024),
