@@ -60,6 +60,7 @@ class MambaRef(Mamba):
 
 class Mampa(nn.Module):
     # Sorry i'm keeping the class here so i don't have to deal with
+    # multi-file coding.
     def __init__(
         self,
         d_model: int,
@@ -83,15 +84,26 @@ class Mampa(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.parallelism_size = parallelism_size
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
-        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        self.use_fast_path = use_fast_path
-        self.layer_idx = layer_idx
-
+        self.d_model = d_model  # 1024
+        self.d_state = d_state  # 16
+        self.d_conv = d_conv  # 4
+        self.expand = expand  # 2
+        self.d_inner = int(self.expand * self.d_model)  # 2048
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank  # 64
+        self.use_fast_path = use_fast_path  # True
+        self.layer_idx = layer_idx  # like 2 and stuff
+        print(f"""
+        Mampa config:
+            {self.parallelism_size=}
+            {self.d_model=}
+            {self.d_state=}
+            {self.d_conv=}
+            {self.expand=}
+            {self.d_inner=}
+            {self.dt_rank=}
+            {self.use_fast_path=}
+            {self.layer_idx=}
+        """)
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
 
         self.conv1d = nn.Conv1d(
@@ -107,10 +119,10 @@ class Mampa(nn.Module):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        self.x_proj = nn.Linear(
+        self.x_proj = nn.Linear(  # 2048 -> ~80
             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
         )
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)  # 64 -> 2048
 
         # Initialize special dt projection to preserve variance at initialization
         dt_init_std = self.dt_rank**-0.5 * dt_scale
@@ -248,6 +260,8 @@ class Mampa(nn.Module):
             C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
         last_state = None
         for i in range(u.shape[2]):
+            # x is hidden state, of shape
+            # B, d_inner, and dstate
             x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
             if not is_variable_C:
                 y = torch.einsum('bdn,dn->bd', x, C)
@@ -468,3 +482,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
+    """
+    Experiment 1 (multi head):
+        cut nlayers to half
+        Mampa class should:
+            per GPU we should run Mampa: a parallel og-Mamba block followed by gather, in-sync FC to project down to d/mp
+        fair comparison is to keep the same number of parameters
+
+    Experiment 2 (Rahul):
+        linear layer TP
+
+    Experiment 3 (SP):
+        parallel prefix scan can do ring-all-reduce kinda thing?
+
+    Experiment 4 (increase effective model dim):
+        increase d_state drastically somehow
+    """
