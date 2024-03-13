@@ -362,8 +362,11 @@ def main(args) -> None:
         optimizer.step()
         tac = timer()
         torch.distributed.barrier()
-        print(f"{step=} rank:{get_global_rank()} loss={float(loss.item()):.2f} iter_time: {tac - tic:.2f}s")
-    pass
+        # Get the current memory allocated and the peak memory allocated
+        current_memory_allocated = torch.cuda.memory_allocated(torch.cuda.current_device()) / 1e9  # Convert bytes to GB
+        peak_memory_allocated = torch.cuda.max_memory_allocated(torch.cuda.current_device()) / 1e9  # Convert bytes to GB
+
+        print(f"{step=} rank:{get_global_rank()} loss={float(loss.item()):.2f} iter_time: {tac - tic:.2f}s | cuda:{torch.cuda.current_device()}(cur_mem: {current_memory_allocated:.2f}GB peak_mem: {peak_memory_allocated:.2f}GB)")
 
 if __name__ == "__main__":
     # torchrun --nproc_per_node=1 benchmarks/train.py -nl 3 -m base -sl 128 -vs 512
