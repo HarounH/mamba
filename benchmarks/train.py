@@ -8,11 +8,14 @@ import random
 import datetime
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, MambaConfig
-from mamba_ssm.ops.selective_scan_interface import mamba_inner_ref, rearrange, repeat
+from mamba_ssm.ops.selective_scan_interface import mamba_inner_ref
 import torch.nn.functional as F
 from timeit import default_timer as timer
 import math
 from torch import nn
+from einops import rearrange, repeat
+
+from causal_conv1d import causal_conv1d_fn
 
 
 class MambaRef(Mamba):
@@ -148,14 +151,7 @@ class Mampa(nn.Module):
 
     def forward(self, hidden_states, inference_params=None):
         batch, seqlen, dim = hidden_states.shape
-
-        conv_state, ssm_state = None, None
-        if inference_params is not None:
-            conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
-            if inference_params.seqlen_offset > 0:
-                # The states are updated inplace
-                out, _, _ = self.step(hidden_states, conv_state, ssm_state)
-                return out
+        # REMOVED inference_params block.
 
         # We do matmul and transpose BLH -> HBL at the same time
         xz = rearrange(
@@ -167,23 +163,112 @@ class Mampa(nn.Module):
             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-        return mamba_inner_ref(
-            xz,
-            self.conv1d.weight,
-            self.conv1d.bias,
-            self.x_proj.weight,
-            self.dt_proj.weight,
-            self.out_proj.weight,
-            self.out_proj.bias,
-            A,
-            None,  # input-dependent B
-            None,  # input-dependent C
-            self.D.float(),
-            delta_bias=self.dt_proj.bias.float(),
-            delta_softplus=True,
-            ssm_ref=True,
-        )
+        #### Define inputs
+        xz=xz
+        conv1d_weight=self.conv1d.weight
+        conv1d_bias=self.conv1d.bias
+        x_proj_weight=self.x_proj.weight
+        delta_proj_weight=self.dt_proj.weight
+        out_proj_weight=self.out_proj.weight
+        out_proj_bias=self.out_proj.bias
+        A=A
+        B=None  # input-dependent B
+        C=None  # input-dependent C
+        B_proj_bias=None
+        C_proj_bias=None
+        D=self.D.float()
+        delta_bias=self.dt_proj.bias.float()
+        delta_softplus=True
+        ssm_ref=True
+        L = xz.shape[-1]
+        delta_rank = delta_proj_weight.shape[1]
+        d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
+        x, z = xz.chunk(2, dim=1)
+        x = causal_conv1d_fn(x, rearrange(conv1d_weight, "d 1 w -> d w"), conv1d_bias, activation="silu")
+        # We're being very careful here about the layout, to avoid extra transposes.
+        # We want delta to have d as the slowest moving dimension
+        # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
+        x_dbl = F.linear(rearrange(x, 'b d l -> (b l) d'), x_proj_weight)  # (bl d)
+        delta = delta_proj_weight @ x_dbl[:, :delta_rank].t()
+        delta = rearrange(delta, "d (b l) -> b d l", l=L)
+        if B is None:  # variable B
+            B = x_dbl[:, delta_rank:delta_rank + d_state]  # (bl d)
+            if B_proj_bias is not None:
+                B = B + B_proj_bias.to(dtype=B.dtype)
+            if not A.is_complex():
+                B = rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous()
+            else:
+                B = rearrange(B, "(b l) (dstate two) -> b dstate (l two)", l=L, two=2).contiguous()
+        if C is None:  # variable B
+            C = x_dbl[:, -d_state:]  # (bl d)
+            if C_proj_bias is not None:
+                C = C + C_proj_bias.to(dtype=C.dtype)
+            if not A.is_complex():
+                C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
+            else:
+                C = rearrange(C, "(b l) (dstate two) -> b dstate (l two)", l=L, two=2).contiguous()
 
+        # SSM ref starts
+        # rename x to u...
+        u = x
+        delta_bias = None
+        delta_softplus=True
+
+        return_last_state=False
+        dtype_in = u.dtype
+        u = u.float()
+        delta = delta.float()
+        if delta_bias is not None:
+            delta = delta + delta_bias[..., None].float()
+        if delta_softplus:
+            delta = F.softplus(delta)
+        batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
+        is_variable_B = B.dim() >= 3
+        is_variable_C = C.dim() >= 3
+        if A.is_complex():
+            if is_variable_B:
+                B = torch.view_as_complex(rearrange(B.float(), "... (L two) -> ... L two", two=2))
+            if is_variable_C:
+                C = torch.view_as_complex(rearrange(C.float(), "... (L two) -> ... L two", two=2))
+        else:
+            B = B.float()
+            C = C.float()
+        x = A.new_zeros((batch, dim, dstate))
+        ys = []
+        deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+        if not is_variable_B:
+            deltaB_u = torch.einsum('bdl,dn,bdl->bdln', delta, B, u)
+        else:
+            if B.dim() == 3:
+                deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+            else:
+                B = repeat(B, "B G N L -> B (G H) N L", H=dim // B.shape[1])
+                deltaB_u = torch.einsum('bdl,bdnl,bdl->bdln', delta, B, u)
+        if is_variable_C and C.dim() == 4:
+            C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
+        last_state = None
+        for i in range(u.shape[2]):
+            x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+            if not is_variable_C:
+                y = torch.einsum('bdn,dn->bd', x, C)
+            else:
+                if C.dim() == 3:
+                    y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
+                else:
+                    y = torch.einsum('bdn,bdn->bd', x, C[:, :, :, i])
+            if i == u.shape[2] - 1:
+                last_state = x
+            if y.is_complex():
+                y = y.real * 2
+            ys.append(y)
+        y = torch.stack(ys, dim=2) # (batch dim L)
+        out = y if D is None else y + u * rearrange(D, "d -> d 1")
+        if z is not None:
+            out = out * F.silu(z)
+        ssm_out = out.to(dtype=dtype_in)
+
+        # End of SSM ref
+        return F.linear(rearrange(ssm_out, "b d l -> b l d"), out_proj_weight, out_proj_bias)
 
 @lru_cache()
 def get_is_torch_run() -> bool:
@@ -337,8 +422,7 @@ def main(args) -> None:
     elif args.model == "ref":
         mamba_cls = MambaRef
     elif args.model == "mampa":
-        # TODO: specify model parallelism in this cls name.
-        raise NotImplementedError("TODO")
+        mamba_cls = Mampa
 
     model = MambaLMHeadModel(
         config=MambaConfig(vocab_size=args.vocab_size, n_layer=n_layer, d_model=1024),
