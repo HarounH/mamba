@@ -6,11 +6,8 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <c10/util/complex.h>  // For scalar_value_type
 
 #define MAX_DSTATE 256
-
-using complex_t = c10::complex<float>;
 
 inline __device__ float2 operator+(const float2 & a, const float2 & b){
     return {a.x + b.x, a.y + b.y};
@@ -89,41 +86,12 @@ struct Converter<at::BFloat16, N>{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// From https://stackoverflow.com/questions/9860711/cucomplex-h-and-exp
-// and https://forums.developer.nvidia.com/t/complex-number-exponential-function/24696
-__device__ __forceinline__ complex_t cexp2f(complex_t z) {
-    float t = exp2f(z.real_);
-    float c, s;
-    sincosf(z.imag_, &s, &c);
-    return complex_t(c * t, s * t);
-}
-
-__device__ __forceinline__ complex_t cexpf(complex_t z) {
-    float t = expf(z.real_);
-    float c, s;
-    sincosf(z.imag_, &s, &c);
-    return complex_t(c * t, s * t);
-}
-
 template<typename scalar_t> struct SSMScanOp;
 
 template<>
 struct SSMScanOp<float> {
     __device__ __forceinline__ float2 operator()(const float2 &ab0, const float2 &ab1) const {
         return make_float2(ab1.x * ab0.x, ab1.x * ab0.y + ab1.y);
-    }
-};
-
-template<>
-struct SSMScanOp<complex_t> {
-    __device__ __forceinline__ float4 operator()(const float4 &ab0, const float4 &ab1) const {
-        complex_t a0 = complex_t(ab0.x, ab0.y);
-        complex_t b0 = complex_t(ab0.z, ab0.w);
-        complex_t a1 = complex_t(ab1.x, ab1.y);
-        complex_t b1 = complex_t(ab1.z, ab1.w);
-        complex_t out_a = a1 * a0;
-        complex_t out_b = a1 * b0 + b1;
-        return make_float4(out_a.real_, out_a.imag_, out_b.real_, out_b.imag_);
     }
 };
 
@@ -168,36 +136,20 @@ inline __device__ void load_weight(typename Ktraits::input_t *Bvar,
                                    typename Ktraits::BlockLoadWeightT::TempStorage &smem_load_weight,
                                    int seqlen) {
     constexpr int kNItems = Ktraits::kNItems;
-    if constexpr (!Ktraits::kIsComplex) {
-        typename Ktraits::input_t B_vals_load[kNItems];
-        if constexpr (Ktraits::kIsEvenLen) {
-            auto& smem_load_weight_vec = reinterpret_cast<typename Ktraits::BlockLoadWeightVecT::TempStorage&>(smem_load_weight);
-            using vec_t = typename Ktraits::vec_t;
-            Ktraits::BlockLoadWeightVecT(smem_load_weight_vec).Load(
-                reinterpret_cast<vec_t*>(Bvar),
-                reinterpret_cast<vec_t(&)[Ktraits::kNLoads]>(B_vals_load)
-          );
-        } else {
-            Ktraits::BlockLoadWeightT(smem_load_weight).Load(Bvar, B_vals_load, seqlen, 0.f);
-        }
-        // #pragma unroll
-        // for (int i = 0; i < kNItems; ++i) { B_vals[i] = B_vals_load[i]; }
-        Converter<typename Ktraits::input_t, kNItems>::to_float(B_vals_load, B_vals);
+    typename Ktraits::input_t B_vals_load[kNItems];
+    if constexpr (Ktraits::kIsEvenLen) {
+        auto& smem_load_weight_vec = reinterpret_cast<typename Ktraits::BlockLoadWeightVecT::TempStorage&>(smem_load_weight);
+        using vec_t = typename Ktraits::vec_t;
+        Ktraits::BlockLoadWeightVecT(smem_load_weight_vec).Load(
+            reinterpret_cast<vec_t*>(Bvar),
+            reinterpret_cast<vec_t(&)[Ktraits::kNLoads]>(B_vals_load)
+      );
     } else {
-        typename Ktraits::input_t B_vals_load[kNItems * 2];
-        if constexpr (Ktraits::kIsEvenLen) {
-            auto& smem_load_weight_vec = reinterpret_cast<typename Ktraits::BlockLoadWeightVecT::TempStorage&>(smem_load_weight);
-            using vec_t = typename Ktraits::vec_t;
-            Ktraits::BlockLoadWeightVecT(smem_load_weight_vec).Load(
-                reinterpret_cast<vec_t*>(Bvar),
-                reinterpret_cast<vec_t(&)[Ktraits::kNLoads * 2]>(B_vals_load)
-          );
-        } else {
-            Ktraits::BlockLoadWeightT(smem_load_weight).Load(Bvar, B_vals_load, seqlen, 0.f);
-        }
-        #pragma unroll
-        for (int i = 0; i < kNItems; ++i) { B_vals[i] = complex_t(B_vals_load[i * 2], B_vals_load[i * 2 + 1]); }
+        Ktraits::BlockLoadWeightT(smem_load_weight).Load(Bvar, B_vals_load, seqlen, 0.f);
     }
+    // #pragma unroll
+    // for (int i = 0; i < kNItems; ++i) { B_vals[i] = B_vals_load[i]; }
+    Converter<typename Ktraits::input_t, kNItems>::to_float(B_vals_load, B_vals);
 }
 
 template<typename Ktraits>

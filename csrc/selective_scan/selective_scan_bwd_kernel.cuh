@@ -21,7 +21,6 @@
 
 template<typename scalar_t> __device__ __forceinline__ scalar_t conj(scalar_t x);
 template<> __device__ __forceinline__ float conj<float>(float x) { return x; }
-template<> __device__ __forceinline__ complex_t conj<complex_t>(complex_t x) { return std::conj(x); }
 
 template<int kNThreads_, int kNItems_, bool kIsEvenLen_, bool kIsVariableB_, bool kIsVariableC_,
          bool kDeltaSoftplus_, bool kHasZ_, typename input_t_, typename weight_t_>
@@ -36,7 +35,6 @@ struct Selective_Scan_bwd_kernel_traits {
     static constexpr int kNElts = kNBytes == 4 ? 4 : std::min(8, kNItems);
     static_assert(kNItems % kNElts == 0);
     static constexpr int kNLoads = kNItems / kNElts;
-    static constexpr bool kIsComplex = std::is_same_v<weight_t, complex_t>;
     static constexpr bool kIsEvenLen = kIsEvenLen_;
     static constexpr bool kIsVariableB = kIsVariableB_;
     static constexpr bool kIsVariableC = kIsVariableC_;
@@ -44,13 +42,13 @@ struct Selective_Scan_bwd_kernel_traits {
     static constexpr bool kHasZ = kHasZ_;
     // Setting MinBlocksPerMP to be 3 (instead of 2) for 128 threads with float improves occupancy.
     // For complex this would lead to massive register spilling, so we keep it at 2.
-    static constexpr int kMinBlocks = kNThreads == 128 && !kIsComplex ? 3 : 2;
+    static constexpr int kMinBlocks = kNThreads == 128 ? 3 : 2;
     using vec_t = typename BytesToType<kNBytes * kNElts>::Type;
-    using scan_t = std::conditional_t<!kIsComplex, float2, float4>;
+    using scan_t = float2;
     using BlockLoadT = cub::BlockLoad<input_t, kNThreads, kNItems, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
     using BlockLoadVecT = cub::BlockLoad<vec_t, kNThreads, kNLoads, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
-    using BlockLoadWeightT = cub::BlockLoad<input_t, kNThreads, !kIsComplex ? kNItems : kNItems * 2, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
-    using BlockLoadWeightVecT = cub::BlockLoad<vec_t, kNThreads, !kIsComplex ? kNLoads : kNLoads * 2, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    using BlockLoadWeightT = cub::BlockLoad<input_t, kNThreads, kNItems, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    using BlockLoadWeightVecT = cub::BlockLoad<vec_t, kNThreads, kNLoads, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
     using BlockStoreT = cub::BlockStore<input_t, kNThreads, kNItems, cub::BLOCK_STORE_WARP_TRANSPOSE>;
     using BlockStoreVecT = cub::BlockStore<vec_t, kNThreads, kNLoads, cub::BLOCK_STORE_WARP_TRANSPOSE>;
     // using BlockScanT = cub::BlockScan<scan_t, kNThreads, cub::BLOCK_SCAN_RAKING_MEMOIZE>;
@@ -59,8 +57,7 @@ struct Selective_Scan_bwd_kernel_traits {
     using BlockReverseScanT = BlockReverseScan<scan_t, kNThreads>;
     using BlockReduceT = cub::BlockReduce<scan_t, kNThreads>;
     using BlockReduceFloatT = cub::BlockReduce<float, kNThreads>;
-    using BlockReduceComplexT = cub::BlockReduce<complex_t, kNThreads>;
-    using BlockExchangeT = cub::BlockExchange<float, kNThreads, !kIsComplex ? kNItems : kNItems * 2>;
+    using BlockExchangeT = cub::BlockExchange<float, kNThreads, kNItems>;
     static constexpr int kSmemIOSize = std::max({sizeof(typename BlockLoadT::TempStorage),
                                                  sizeof(typename BlockLoadVecT::TempStorage),
                                                  (int(kIsVariableB) + int(kIsVariableC)) * sizeof(typename BlockLoadWeightT::TempStorage),
@@ -75,7 +72,6 @@ struct Selective_Scan_bwd_kernel_traits {
 template<typename Ktraits>
 __global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocks)
 void selective_scan_bwd_kernel(SSMParamsBwd params) {
-    constexpr bool kIsComplex = Ktraits::kIsComplex;
     constexpr bool kIsVariableB = Ktraits::kIsVariableB;
     constexpr bool kIsVariableC = Ktraits::kIsVariableC;
     constexpr bool kDeltaSoftplus = Ktraits::kDeltaSoftplus;
@@ -100,7 +96,6 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
     auto& smem_exchange1 = *reinterpret_cast<typename Ktraits::BlockExchangeT::TempStorage*>(smem_ + Ktraits::kSmemIOSize + sizeof(typename Ktraits::BlockExchangeT::TempStorage));
     auto& smem_reduce = *reinterpret_cast<typename Ktraits::BlockReduceT::TempStorage*>(reinterpret_cast<char *>(&smem_exchange) + Ktraits::kSmemExchangeSize);
     auto& smem_reduce_float = *reinterpret_cast<typename Ktraits::BlockReduceFloatT::TempStorage*>(&smem_reduce);
-    auto& smem_reduce_complex = *reinterpret_cast<typename Ktraits::BlockReduceComplexT::TempStorage*>(&smem_reduce);
     auto& smem_scan = *reinterpret_cast<typename Ktraits::BlockScanT::TempStorage*>(reinterpret_cast<char *>(&smem_reduce) + Ktraits::kSmemReduceSize);
     auto& smem_reverse_scan = *reinterpret_cast<typename Ktraits::BlockReverseScanT::TempStorage*>(reinterpret_cast<char *>(&smem_scan) + sizeof(typename Ktraits::BlockScanT::TempStorage));
     weight_t *smem_delta_a = reinterpret_cast<weight_t *>(smem_ + Ktraits::kSmemSize);
@@ -124,9 +119,9 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
     input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + batch_id * params.C_batch_stride + group_id * params.C_group_stride;
     weight_t *dA = reinterpret_cast<weight_t *>(params.dA_ptr) + dim_id * params.dA_d_stride;
     weight_t *dB = reinterpret_cast<weight_t *>(params.dB_ptr)
-        + (!kIsVariableB ? dim_id * params.dB_d_stride : batch_id * (!kIsComplex ? params.dB_batch_stride : params.dB_batch_stride / 2) + group_id * params.dB_group_stride);
+        + (!kIsVariableB ? dim_id * params.dB_d_stride : batch_id * params.dB_batch_stride) + group_id * params.dB_group_stride;
     weight_t *dC = reinterpret_cast<weight_t *>(params.dC_ptr)
-        + (!kIsVariableC ? dim_id * params.dC_d_stride : batch_id * (!kIsComplex ? params.dC_batch_stride : params.dC_batch_stride / 2) + group_id * params.dC_group_stride);
+        + (!kIsVariableC ? dim_id * params.dC_d_stride : batch_id * params.dC_batch_stride) + group_id * params.dC_group_stride;
     float *dD = params.dD_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.dD_ptr) + dim_id;
     float D_val = params.D_ptr == nullptr ? 0 : reinterpret_cast<float *>(params.D_ptr)[dim_id];
     float *ddelta_bias = params.ddelta_bias_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.ddelta_bias_ptr) + dim_id;
@@ -141,8 +136,8 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
     u += (params.n_chunks - 1) * kChunkSize;
     delta += (params.n_chunks - 1) * kChunkSize;
     dout += (params.n_chunks - 1) * kChunkSize;
-    Bvar += (params.n_chunks - 1) * kChunkSize * (!kIsComplex ? 1 : 2);
-    Cvar += (params.n_chunks - 1) * kChunkSize * (!kIsComplex ? 1 : 2);
+    Bvar += (params.n_chunks - 1) * kChunkSize;
+    Cvar += (params.n_chunks - 1) * kChunkSize;
     for (int chunk = params.n_chunks - 1; chunk >= 0; --chunk) {
         input_t u_vals[kNItems];
         input_t delta_vals_load[kNItems];
@@ -219,220 +214,108 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
             // Multiply the real part of A with LOG2E so we can use exp2f instead of expf.
             weight_t A_scaled;
             constexpr float kLog2e = M_LOG2E;
-            if constexpr (!kIsComplex) {
-                A_scaled = A_val * kLog2e;
-            } else {
-                A_scaled = complex_t(A_val.real_ * kLog2e, A_val.imag_);
-            }
+            A_scaled = A_val * kLog2e;
             weight_t B_val, C_val;
             weight_t B_vals[kNItems], C_vals[kNItems];
             if constexpr (!kIsVariableB) {
                 B_val = B[state_idx * params.B_dstate_stride];
             } else {
                 load_weight<Ktraits>(Bvar + state_idx * params.B_dstate_stride, B_vals,
-                    smem_load_weight, (params.seqlen - chunk * kChunkSize) * (!kIsComplex ? 1 : 2));
+                    smem_load_weight, params.seqlen - chunk * kChunkSize);
             }
             if constexpr (!kIsVariableC) {
                 C_val = C[state_idx * params.C_dstate_stride];
             } else {
                 auto &smem_load_weight_C = !kIsVariableB ? smem_load_weight : smem_load_weight1;
                 load_weight<Ktraits>(Cvar + state_idx * params.C_dstate_stride, C_vals,
-                    smem_load_weight_C, (params.seqlen - chunk * kChunkSize) * (!kIsComplex ? 1 : 2));
+                    smem_load_weight_C, params.seqlen - chunk * kChunkSize);
             }
             // const weight_t A_val = smem_a[state_idx];
             scan_t thread_data[kNItems], thread_reverse_data[kNItems];
-            if constexpr (!kIsComplex) {
-                #pragma unroll
-                for (int i = 0; i < kNItems; ++i) {
-                    const float delta_a_exp = exp2f(delta_vals[i] * A_scaled);
-                    thread_data[i] = make_float2(delta_a_exp, !kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i]);
-                    if (i == 0) {
-                        smem_delta_a[threadIdx.x == 0 ? state_idx + (chunk % 2) * MAX_DSTATE : threadIdx.x + 2 * MAX_DSTATE] = delta_a_exp;
-                    } else {
-                        thread_reverse_data[i - 1].x = delta_a_exp;
-                    }
-                    thread_reverse_data[i].y = dout_vals[i] *
-                        (!kIsVariableC
-                         ? (!kIsVariableB ? B_val * C_val : C_val)
-                         : (!kIsVariableB ? B_val * C_vals[i] : C_vals[i]));
-                }
-                __syncthreads();
-                thread_reverse_data[kNItems - 1].x = threadIdx.x == kNThreads - 1
-                    ? (chunk == params.n_chunks - 1 ? 1.f : smem_delta_a[state_idx + ((chunk + 1) % 2) * MAX_DSTATE])
-                    : smem_delta_a[threadIdx.x + 1 + 2 * MAX_DSTATE];
-                // Initialize running total
-                scan_t running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? x[(chunk - 1) * params.dstate + state_idx] : make_float2(1.f, 0.f);
-                SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
-                Ktraits::BlockScanT(smem_scan).InclusiveScan(
-                    thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
-                );
-                scan_t running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? smem_running_postfix[state_idx] : make_float2(1.f, 0.f);
-                SSMScanPrefixCallbackOp<weight_t> postfix_op(running_postfix);
-                Ktraits::BlockReverseScanT(smem_reverse_scan).InclusiveReverseScan(
-                    thread_reverse_data, thread_reverse_data, SSMScanOp<weight_t>(), postfix_op
-                );
-                if (threadIdx.x == 0) { smem_running_postfix[state_idx] = postfix_op.running_prefix; }
-                weight_t dA_val = 0, dBC_val = 0;
-                weight_t dB_vals[kNItems], dC_vals[kNItems];
-                #pragma unroll
-                for (int i = 0; i < kNItems; ++i) {
-                    const float dx = thread_reverse_data[i].y;
-                    const float ddelta_u = !kIsVariableB ? dx : dx * B_vals[i];
-                    du_vals[i] += ddelta_u * delta_vals[i];
-                    const float a = thread_data[i].y - (!kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i]);
-                    ddelta_vals[i] += ddelta_u * float(u_vals[i]) + dx * A_val * a;
-                    dA_val += dx * delta_vals[i] * a;
-                    if constexpr (!kIsVariableB || !kIsVariableC) {
-                        if constexpr (!kIsVariableB) {  // dBC_val is dB_val
-                            dBC_val += dout_vals[i] * (!kIsVariableC ? thread_data[i].y : thread_data[i].y * C_vals[i]);
-                        } else {  // dBC_val is dC_val
-                            dBC_val += dout_vals[i] * thread_data[i].y;
-                        }
-                    }
-                    if constexpr (kIsVariableB) { dB_vals[i] = dx * delta_vals[i] * float(u_vals[i]); }
-                    if constexpr (kIsVariableC) {
-                        dC_vals[i] = dout_vals[i] * (!kIsVariableB ? thread_data[i].y * B_val : thread_data[i].y);
-                    }
-                }
-                // Block-exchange to make the atomicAdd's coalesced, otherwise they're much slower
-                if constexpr (kIsVariableB || kIsVariableC) {
-                    if constexpr (kIsVariableB) {
-                        Ktraits::BlockExchangeT(smem_exchange).BlockedToStriped(dB_vals, dB_vals);
-                    }
-                    if constexpr (kIsVariableC) {
-                        auto &smem_exchange_C = !kIsVariableB ? smem_exchange : smem_exchange1;
-                        Ktraits::BlockExchangeT(smem_exchange_C).BlockedToStriped(dC_vals, dC_vals);
-                    }
-                    const int seqlen_remaining = params.seqlen - chunk * kChunkSize - threadIdx.x;
-                    weight_t *dB_cur = dB + state_idx * params.dB_dstate_stride + chunk * kChunkSize + threadIdx.x;
-                    weight_t *dC_cur = dC + state_idx * params.dC_dstate_stride + chunk * kChunkSize + threadIdx.x;
-                    #pragma unroll
-                    for (int i = 0; i < kNItems; ++i) {
-                        if (i * kNThreads < seqlen_remaining) {
-                            if constexpr (kIsVariableB) { gpuAtomicAdd(dB_cur + i * kNThreads, dB_vals[i]); }
-                            if constexpr (kIsVariableC) { gpuAtomicAdd(dC_cur + i * kNThreads, dC_vals[i]); }
-                        }
-                    }
-                }
-                if constexpr (!kIsVariableB || !kIsVariableC) {
-                    float2 dA_dBC_val = make_float2(dA_val, dBC_val);
-                    dA_dBC_val = Ktraits::BlockReduceT(smem_reduce).Sum(dA_dBC_val);
-                    dA_val = dA_dBC_val.x;
-                    if (threadIdx.x == 0) {
-                        smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dA_dBC_val.y : dA_dBC_val.y + smem_dbc[state_idx];
-                    }
+            #pragma unroll
+            for (int i = 0; i < kNItems; ++i) {
+                const float delta_a_exp = exp2f(delta_vals[i] * A_scaled);
+                thread_data[i] = make_float2(delta_a_exp, !kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i]);
+                if (i == 0) {
+                    smem_delta_a[threadIdx.x == 0 ? state_idx + (chunk % 2) * MAX_DSTATE : threadIdx.x + 2 * MAX_DSTATE] = delta_a_exp;
                 } else {
-                    dA_val = Ktraits::BlockReduceFloatT(smem_reduce_float).Sum(dA_val);
+                    thread_reverse_data[i - 1].x = delta_a_exp;
                 }
+                thread_reverse_data[i].y = dout_vals[i] *
+                    (!kIsVariableC
+                     ? (!kIsVariableB ? B_val * C_val : C_val)
+                     : (!kIsVariableB ? B_val * C_vals[i] : C_vals[i]));
+            }
+            __syncthreads();
+            thread_reverse_data[kNItems - 1].x = threadIdx.x == kNThreads - 1
+                ? (chunk == params.n_chunks - 1 ? 1.f : smem_delta_a[state_idx + ((chunk + 1) % 2) * MAX_DSTATE])
+                : smem_delta_a[threadIdx.x + 1 + 2 * MAX_DSTATE];
+            // Initialize running total
+            scan_t running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? x[(chunk - 1) * params.dstate + state_idx] : make_float2(1.f, 0.f);
+            SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
+            Ktraits::BlockScanT(smem_scan).InclusiveScan(
+                thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
+            );
+            scan_t running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? smem_running_postfix[state_idx] : make_float2(1.f, 0.f);
+            SSMScanPrefixCallbackOp<weight_t> postfix_op(running_postfix);
+            Ktraits::BlockReverseScanT(smem_reverse_scan).InclusiveReverseScan(
+                thread_reverse_data, thread_reverse_data, SSMScanOp<weight_t>(), postfix_op
+            );
+            if (threadIdx.x == 0) { smem_running_postfix[state_idx] = postfix_op.running_prefix; }
+            weight_t dA_val = 0, dBC_val = 0;
+            weight_t dB_vals[kNItems], dC_vals[kNItems];
+            #pragma unroll
+            for (int i = 0; i < kNItems; ++i) {
+                const float dx = thread_reverse_data[i].y;
+                const float ddelta_u = !kIsVariableB ? dx : dx * B_vals[i];
+                du_vals[i] += ddelta_u * delta_vals[i];
+                const float a = thread_data[i].y - (!kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i]);
+                ddelta_vals[i] += ddelta_u * float(u_vals[i]) + dx * A_val * a;
+                dA_val += dx * delta_vals[i] * a;
+                if constexpr (!kIsVariableB || !kIsVariableC) {
+                    if constexpr (!kIsVariableB) {  // dBC_val is dB_val
+                        dBC_val += dout_vals[i] * (!kIsVariableC ? thread_data[i].y : thread_data[i].y * C_vals[i]);
+                    } else {  // dBC_val is dC_val
+                        dBC_val += dout_vals[i] * thread_data[i].y;
+                    }
+                }
+                if constexpr (kIsVariableB) { dB_vals[i] = dx * delta_vals[i] * float(u_vals[i]); }
+                if constexpr (kIsVariableC) {
+                    dC_vals[i] = dout_vals[i] * (!kIsVariableB ? thread_data[i].y * B_val : thread_data[i].y);
+                }
+            }
+            // Block-exchange to make the atomicAdd's coalesced, otherwise they're much slower
+            if constexpr (kIsVariableB || kIsVariableC) {
+                if constexpr (kIsVariableB) {
+                    Ktraits::BlockExchangeT(smem_exchange).BlockedToStriped(dB_vals, dB_vals);
+                }
+                if constexpr (kIsVariableC) {
+                    auto &smem_exchange_C = !kIsVariableB ? smem_exchange : smem_exchange1;
+                    Ktraits::BlockExchangeT(smem_exchange_C).BlockedToStriped(dC_vals, dC_vals);
+                }
+                const int seqlen_remaining = params.seqlen - chunk * kChunkSize - threadIdx.x;
+                weight_t *dB_cur = dB + state_idx * params.dB_dstate_stride + chunk * kChunkSize + threadIdx.x;
+                weight_t *dC_cur = dC + state_idx * params.dC_dstate_stride + chunk * kChunkSize + threadIdx.x;
+                #pragma unroll
+                for (int i = 0; i < kNItems; ++i) {
+                    if (i * kNThreads < seqlen_remaining) {
+                        if constexpr (kIsVariableB) { gpuAtomicAdd(dB_cur + i * kNThreads, dB_vals[i]); }
+                        if constexpr (kIsVariableC) { gpuAtomicAdd(dC_cur + i * kNThreads, dC_vals[i]); }
+                    }
+                }
+            }
+            if constexpr (!kIsVariableB || !kIsVariableC) {
+                float2 dA_dBC_val = make_float2(dA_val, dBC_val);
+                dA_dBC_val = Ktraits::BlockReduceT(smem_reduce).Sum(dA_dBC_val);
+                dA_val = dA_dBC_val.x;
                 if (threadIdx.x == 0) {
-                    smem_da[state_idx] = chunk == params.n_chunks - 1 ? dA_val : dA_val + smem_da[state_idx];
+                    smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dA_dBC_val.y : dA_dBC_val.y + smem_dbc[state_idx];
                 }
             } else {
-                #pragma unroll
-                for (int i = 0; i < kNItems; ++i) {
-                    // Pytorch's implementation of complex exp (which calls thrust) is very slow
-                    complex_t delta_a_exp = cexp2f(delta_vals[i] * A_scaled);
-                    weight_t B_delta_u_val = !kIsVariableB ? delta_vals[i] * float(u_vals[i]) : B_vals[i] * delta_vals[i] * float(u_vals[i]);
-                    thread_data[i] = make_float4(delta_a_exp.real_, delta_a_exp.imag_, B_delta_u_val.real_, B_delta_u_val.imag_);
-                    if (i == 0) {
-                        smem_delta_a[threadIdx.x == 0 ? state_idx + (chunk % 2) * MAX_DSTATE : threadIdx.x + 2 * MAX_DSTATE] = delta_a_exp;
-                    } else {
-                        thread_reverse_data[i - 1].x = delta_a_exp.real_;
-                        thread_reverse_data[i - 1].y = -delta_a_exp.imag_;
-                    }
-                    complex_t dout_BC = 2 * dout_vals[i]
-                        * conj(!kIsVariableC
-                                ? (!kIsVariableB ? B_val * C_val : C_val)
-                                : (!kIsVariableB ? B_val * C_vals[i] : C_vals[i]));
-                    thread_reverse_data[i].z = dout_BC.real_;
-                    thread_reverse_data[i].w = dout_BC.imag_;
-                }
-                __syncthreads();
-                complex_t delta_a_exp = threadIdx.x == kNThreads - 1
-                    ? (chunk == params.n_chunks - 1 ? 1.f : smem_delta_a[state_idx + ((chunk + 1) % 2) * MAX_DSTATE])
-                    : smem_delta_a[threadIdx.x + 1 + 2 * MAX_DSTATE];
-                thread_reverse_data[kNItems - 1].x = delta_a_exp.real_;
-                thread_reverse_data[kNItems - 1].y = -delta_a_exp.imag_;
-                // Initialize running total
-                scan_t running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? x[(chunk - 1) * params.dstate + state_idx] : make_float4(1.f, 0.f, 0.f, 0.f);
-                SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
-                Ktraits::BlockScanT(smem_scan).InclusiveScan(
-                    thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
-                );
-                scan_t running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? smem_running_postfix[state_idx] : make_float4(1.f, 0.f, 0.f, 0.f);
-                SSMScanPrefixCallbackOp<weight_t> postfix_op(running_postfix);
-                Ktraits::BlockReverseScanT(smem_reverse_scan).InclusiveReverseScan(
-                    thread_reverse_data, thread_reverse_data, SSMScanOp<weight_t>(), postfix_op
-                );
-                if (threadIdx.x == 0) { smem_running_postfix[state_idx] = postfix_op.running_prefix; }
-                weight_t dA_val = 0, dBC_val = 0;
-                weight_t dB_vals[kNItems], dC_vals[kNItems];
-                #pragma unroll
-                for (int i = 0; i < kNItems; ++i) {
-                    complex_t x = complex_t(thread_data[i].z, thread_data[i].w);
-                    complex_t dx = complex_t(thread_reverse_data[i].z, thread_reverse_data[i].w);
-                    float ddelta_u = !kIsVariableB ? dx.real_ : (dx * conj(B_vals[i])).real_;
-                    if constexpr (!kIsVariableB || !kIsVariableC) {
-                        if constexpr (!kIsVariableB) {  // dBC_val is dB_val
-                            dBC_val += (2 * dout_vals[i]) * conj(!kIsVariableC ? x : x * C_vals[i]);
-                        } else {  // dBC_val is dC_val
-                            dBC_val += (2 * dout_vals[i]) * conj(x);
-                        }
-                    }
-                    const complex_t a_conj = conj(x - (!kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i]));
-                    du_vals[i] += ddelta_u * delta_vals[i];
-                    ddelta_vals[i] += ddelta_u * float(u_vals[i]) + (dx * conj(A_val) * a_conj).real_;
-                    dA_val += delta_vals[i] * dx * a_conj;
-                    if constexpr (kIsVariableB) { dB_vals[i] = dx * delta_vals[i] * float(u_vals[i]); }
-                    if constexpr (kIsVariableC) {
-                        dC_vals[i] = (2 * dout_vals[i]) * conj(!kIsVariableB ? x * B_val : x);
-                    }
-                }
-                // Block-exchange to make the atomicAdd's coalesced, otherwise they're much slower
-                if constexpr (kIsVariableB || kIsVariableC) {
-                    float dB_vals_f[kNItems * 2], dC_vals_f[kNItems * 2];
-                    if constexpr (kIsVariableB) {
-                        #pragma unroll
-                        for (int i = 0; i < kNItems; ++i) {
-                            dB_vals_f[i * 2] = dB_vals[i].real_;
-                            dB_vals_f[i * 2 + 1] = dB_vals[i].imag_;
-                        }
-                        Ktraits::BlockExchangeT(smem_exchange).BlockedToStriped(dB_vals_f, dB_vals_f);
-                    }
-                    if constexpr (kIsVariableC) {
-                        #pragma unroll
-                        for (int i = 0; i < kNItems; ++i) {
-                            dC_vals_f[i * 2] = dC_vals[i].real_;
-                            dC_vals_f[i * 2 + 1] = dC_vals[i].imag_;
-                        }
-                        auto &smem_exchange_C = !kIsVariableB ? smem_exchange : smem_exchange1;
-                        Ktraits::BlockExchangeT(smem_exchange_C).BlockedToStriped(dC_vals_f, dC_vals_f);
-                    }
-                    const int seqlen_remaining = (params.seqlen - chunk * kChunkSize) * 2 - threadIdx.x;
-                    float *dB_cur = reinterpret_cast<float *>(dB) + state_idx * params.dB_dstate_stride + chunk * kChunkSize * 2 + threadIdx.x;
-                    float *dC_cur = reinterpret_cast<float *>(dC) + state_idx * params.dC_dstate_stride + chunk * kChunkSize * 2 + threadIdx.x;
-                    #pragma unroll
-                    for (int i = 0; i < kNItems * 2; ++i) {
-                        if (i * kNThreads < seqlen_remaining) {
-                            if constexpr (kIsVariableB) { gpuAtomicAdd(dB_cur + i * kNThreads, dB_vals_f[i]); }
-                            if constexpr (kIsVariableC) { gpuAtomicAdd(dC_cur + i * kNThreads, dC_vals_f[i]); }
-                        }
-                    }
-                }
-                if constexpr (!kIsVariableB || !kIsVariableC) {
-                    float4 dA_dBC_val = make_float4(dA_val.real_, dA_val.imag_, dBC_val.real_, dBC_val.imag_);
-                    dA_dBC_val = Ktraits::BlockReduceT(smem_reduce).Sum(dA_dBC_val);
-                    dA_val = complex_t(dA_dBC_val.x, dA_dBC_val.y);
-                    dBC_val = complex_t(dA_dBC_val.z, dA_dBC_val.w);
-                    if (threadIdx.x == 0) {
-                        smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dBC_val : dBC_val + smem_dbc[state_idx];
-                    }
-                } else {
-                    dA_val = Ktraits::BlockReduceComplexT(smem_reduce_complex).Sum(dA_val);
-                }
-                if (threadIdx.x == 0) {
-                    smem_da[state_idx] = chunk == params.n_chunks - 1 ? dA_val : dA_val + smem_da[state_idx];
-                }
+                dA_val = Ktraits::BlockReduceFloatT(smem_reduce_float).Sum(dA_val);
+            }
+            if (threadIdx.x == 0) {
+                smem_da[state_idx] = chunk == params.n_chunks - 1 ? dA_val : dA_val + smem_da[state_idx];
             }
         }
 
@@ -461,8 +344,8 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
         __syncthreads();
         store_output<Ktraits>(ddelta, ddelta_vals, smem_store, params.seqlen - chunk * kChunkSize);
 
-        Bvar -= kChunkSize * (!kIsComplex ? 1 : 2);
-        Cvar -= kChunkSize * (!kIsComplex ? 1 : 2);
+        Bvar -= kChunkSize;
+        Cvar -= kChunkSize;
     }
     if (params.dD_ptr != nullptr) {
         dD_val = Ktraits::BlockReduceFloatT(smem_reduce_float).Sum(dD_val);

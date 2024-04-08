@@ -43,9 +43,6 @@
     if (WTYPE == at::ScalarType::Float) {                                            \
        using weight_t = float;                                                       \
         __VA_ARGS__();                                                               \
-    } else if (WTYPE == at::ScalarType::ComplexFloat) {                              \
-        using weight_t = c10::complex<float>;                                        \
-        __VA_ARGS__();                                                               \
     } else {                                                                         \
         AT_ERROR(#NAME, " not implemented for weight type '", toString(WTYPE), "'"); \
     }
@@ -233,11 +230,10 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
-    TORCH_CHECK(weight_type == at::ScalarType::Float || weight_type == at::ScalarType::ComplexFloat);
+    TORCH_CHECK(weight_type == at::ScalarType::Float);
 
     const bool is_variable_B = B.dim() >= 3;
     const bool is_variable_C = C.dim() >= 3;
-    const bool is_complex = weight_type == at::ScalarType::ComplexFloat;
 
     TORCH_CHECK(delta.scalar_type() == input_type);
     TORCH_CHECK(B.scalar_type() == (!is_variable_B ? weight_type : input_type));
@@ -267,13 +263,13 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
     if (!is_variable_B) {
         CHECK_SHAPE(B, dim, dstate);
     } else {
-        CHECK_SHAPE(B, batch_size, n_groups, dstate, !is_complex ? seqlen : seqlen * 2);
+        CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen);
         TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
     }
     if (!is_variable_C) {
         CHECK_SHAPE(C, dim, dstate);
     } else {
-        CHECK_SHAPE(C, batch_size, n_groups, dstate, !is_complex ? seqlen: seqlen * 2);
+        CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen);
         TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
     }
 
@@ -350,11 +346,10 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
-    TORCH_CHECK(weight_type == at::ScalarType::Float || weight_type == at::ScalarType::ComplexFloat);
+    TORCH_CHECK(weight_type == at::ScalarType::Float);
 
     const bool is_variable_B = B.dim() >= 3;
     const bool is_variable_C = C.dim() >= 3;
-    const bool is_complex = weight_type == at::ScalarType::ComplexFloat;
 
     TORCH_CHECK(delta.scalar_type() == input_type);
     TORCH_CHECK(B.scalar_type() == (!is_variable_B ? weight_type : input_type));
@@ -387,13 +382,13 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
     if (!is_variable_B) {
         CHECK_SHAPE(B, dim, dstate);
     } else {
-        CHECK_SHAPE(B, batch_size, n_groups, dstate, !is_complex ? seqlen : seqlen * 2);
+        CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen);
         TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
     }
     if (!is_variable_C) {
         CHECK_SHAPE(C, dim, dstate);
     } else {
-        CHECK_SHAPE(C, batch_size, n_groups, dstate, !is_complex ? seqlen: seqlen * 2);
+        CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen);
         TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
     }
     CHECK_SHAPE(dout, batch_size, dim, seqlen);
