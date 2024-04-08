@@ -34,8 +34,6 @@ struct Selective_Scan_fwd_kernel_traits {
     static_assert(kNItems % kNElts == 0);
     static constexpr int kNLoads = kNItems / kNElts;
     static constexpr bool kIsEvenLen = kIsEvenLen_;
-    static constexpr bool kIsVariableB = kIsVariableB_;
-    static constexpr bool kIsVariableC = kIsVariableC_;
     static constexpr bool kHasZ = kHasZ_;
 
     static constexpr bool kDirectIO = kIsEvenLen && kNLoads == 1;
@@ -56,8 +54,8 @@ struct Selective_Scan_fwd_kernel_traits {
     using BlockScanT = cub::BlockScan<scan_t, kNThreads, cub::BLOCK_SCAN_WARP_SCANS>;
     static constexpr int kSmemIOSize = std::max({sizeof(typename BlockLoadT::TempStorage),
                                                  sizeof(typename BlockLoadVecT::TempStorage),
-                                                 (int(kIsVariableB) + int(kIsVariableC)) * sizeof(typename BlockLoadWeightT::TempStorage),
-                                                 (int(kIsVariableB) + int(kIsVariableC)) * sizeof(typename BlockLoadWeightVecT::TempStorage),
+                                                 2 * sizeof(typename BlockLoadWeightT::TempStorage),
+                                                 2 * sizeof(typename BlockLoadWeightVecT::TempStorage),
                                                  sizeof(typename BlockStoreT::TempStorage),
                                                  sizeof(typename BlockStoreVecT::TempStorage)});
     static constexpr int kSmemSize = kSmemIOSize + sizeof(typename BlockScanT::TempStorage);
@@ -66,8 +64,6 @@ struct Selective_Scan_fwd_kernel_traits {
 template<typename Ktraits>
 __global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocks)
 void selective_scan_fwd_kernel(SSMParamsBase params) {
-    constexpr bool kIsVariableB = Ktraits::kIsVariableB;
-    constexpr bool kIsVariableC = Ktraits::kIsVariableC;
     constexpr bool kHasZ = Ktraits::kHasZ;
     constexpr int kNThreads = Ktraits::kNThreads;
     constexpr int kNItems = Ktraits::kNItems;
@@ -172,33 +168,11 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             // If both B and C vary, this is unused.
             weight_t BC_val[kNRows];
             weight_t B_vals[kNItems], C_vals[kNItems];
-            if constexpr (kIsVariableB) {
-                load_weight<Ktraits>(Bvar + state_idx * params.B_dstate_stride, B_vals,
-                    smem_load_weight, (params.seqlen - chunk * kChunkSize) );
-                if constexpr (!kIsVariableC) {
-                    #pragma unroll
-                    for (int r = 0; r < kNRows; ++r) {
-                        BC_val[r] = C[state_idx * params.C_dstate_stride + r * params.C_d_stride];
-                    }
-                }
-            }
-            if constexpr (kIsVariableC) {
-                auto &smem_load_weight_C = !kIsVariableB ? smem_load_weight : smem_load_weight1;
-                load_weight<Ktraits>(Cvar + state_idx * params.C_dstate_stride, C_vals,
-                    smem_load_weight_C, (params.seqlen - chunk * kChunkSize) );
-                if constexpr (!kIsVariableB) {
-                    #pragma unroll
-                    for (int r = 0; r < kNRows; ++r) {
-                        BC_val[r] = B[state_idx * params.B_dstate_stride + r * params.B_d_stride];
-                    }
-                }
-            }
-            if constexpr (!kIsVariableB && !kIsVariableC) {
-                #pragma unroll
-                for (int r = 0; r < kNRows; ++r) {
-                    BC_val[r] = B[state_idx * params.B_dstate_stride + r * params.B_d_stride] * C[state_idx * params.C_dstate_stride + r * params.C_d_stride];
-                }
-            }
+            load_weight<Ktraits>(Bvar + state_idx * params.B_dstate_stride, B_vals,
+                smem_load_weight, (params.seqlen - chunk * kChunkSize) );
+            auto &smem_load_weight_C = smem_load_weight1;
+            load_weight<Ktraits>(Cvar + state_idx * params.C_dstate_stride, C_vals,
+                smem_load_weight_C, (params.seqlen - chunk * kChunkSize) );
 
             #pragma unroll
             for (int r = 0; r < kNRows; ++r) {
@@ -207,7 +181,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     thread_data[i] = make_float2(exp2f(delta_vals[r][i] * A_val[r]),
-                                                 !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i]);
+                                                 B_vals[i] * delta_u_vals[r][i]);
                     if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
                         if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
                             thread_data[i] = make_float2(1.f, 0.f);
@@ -231,9 +205,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 }
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
-                    const weight_t C_val = !kIsVariableC
-                        ? BC_val[r]
-                        : (!kIsVariableB ? BC_val[r] * C_vals[i] : C_vals[i]);
+                    const weight_t C_val = C_vals[i];
                     out_vals[r][i] += thread_data[i].y * C_val;
                 }
             }

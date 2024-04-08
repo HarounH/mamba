@@ -153,10 +153,10 @@ def test_selective_scan(is_variable_B, is_variable_C, varBC_groups, has_D, has_z
 @pytest.mark.parametrize('itype', [torch.float32])
 # @pytest.mark.parametrize('seqlen', [8, 16, 32, 64, 128, 256, 372, 512, 784, 1024, 1134, 2048, 4096])
 @pytest.mark.parametrize('seqlen', [128])
-@pytest.mark.parametrize("is_variable_C", [False, True])
-# @pytest.mark.parametrize("is_variable_C", [False])
-@pytest.mark.parametrize("is_variable_B", [False, True])
-# @pytest.mark.parametrize("is_variable_B", [True])
+# @pytest.mark.parametrize("is_variable_C", [False, True])
+@pytest.mark.parametrize("is_variable_C", [True])
+# @pytest.mark.parametrize("is_variable_B", [False, True])
+@pytest.mark.parametrize("is_variable_B", [True])
 def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype):
     device = 'cuda'
     rtol, atol = (6e-4, 2e-3) if itype == torch.float32 else (3e-3, 5e-3)

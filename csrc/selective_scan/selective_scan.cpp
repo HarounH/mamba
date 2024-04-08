@@ -91,9 +91,6 @@ void set_ssm_params_fwd(SSMParamsBase &params,
 
     params.delta_softplus = delta_softplus;
 
-    params.is_variable_B = is_variable_B;
-    params.is_variable_C = is_variable_C;
-
     // Set the pointers and strides.
     params.u_ptr = u.data_ptr();
     params.delta_ptr = delta.data_ptr();
@@ -109,20 +106,12 @@ void set_ssm_params_fwd(SSMParamsBase &params,
     // All stride are in elements, not bytes.
     params.A_d_stride = A.stride(0);
     params.A_dstate_stride = A.stride(1);
-    if (!is_variable_B) {
-        params.B_d_stride = B.stride(0);
-    } else {
-        params.B_batch_stride = B.stride(0);
-        params.B_group_stride = B.stride(1);
-    }
-    params.B_dstate_stride = !is_variable_B ? B.stride(1) : B.stride(2);
-    if (!is_variable_C) {
-        params.C_d_stride = C.stride(0);
-    } else {
-        params.C_batch_stride = C.stride(0);
-        params.C_group_stride = C.stride(1);
-    }
-    params.C_dstate_stride = !is_variable_C ? C.stride(1) : C.stride(2);
+    params.B_batch_stride = B.stride(0);
+    params.B_group_stride = B.stride(1);
+    params.B_dstate_stride = B.stride(2);
+    params.C_batch_stride = C.stride(0);
+    params.C_group_stride = C.stride(1);
+    params.C_dstate_stride = C.stride(2);
     params.u_batch_stride = u.stride(0);
     params.u_d_stride = u.stride(1);
     params.delta_batch_stride = delta.stride(0);
@@ -172,7 +161,7 @@ void set_ssm_params_bwd(SSMParamsBwd &params,
                         bool delta_softplus,
                         bool recompute_out_z) {
     // Pass in "dout" instead of "out", we're not gonna use "out" unless we have z
-    set_ssm_params_fwd(params, batch, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
+    set_ssm_params_fwd(params, batch, dim, seqlen, dstate, n_groups, n_chunks, true, true,
                        u, delta, A, B, C, has_z ? out : dout,
                        has_z ? z : dout,
                        // If not recompute_out_z, pass dout instead of out_z.
@@ -196,20 +185,12 @@ void set_ssm_params_bwd(SSMParamsBwd &params,
     params.dout_d_stride = dout.stride(1);
     params.dA_d_stride = dA.stride(0);
     params.dA_dstate_stride = dA.stride(1);
-    if (!is_variable_B) {
-        params.dB_d_stride = dB.stride(0);
-    } else {
-        params.dB_batch_stride = dB.stride(0);
-        params.dB_group_stride = dB.stride(1);
-    }
-    params.dB_dstate_stride = !is_variable_B ? dB.stride(1) : dB.stride(2);
-    if (!is_variable_C) {
-        params.dC_d_stride = dC.stride(0);
-    } else {
-        params.dC_batch_stride = dC.stride(0);
-        params.dC_group_stride = dC.stride(1);
-    }
-    params.dC_dstate_stride = !is_variable_C ? dC.stride(1) : dC.stride(2);
+    params.dB_batch_stride = dB.stride(0);
+    params.dB_group_stride = dB.stride(1);
+    params.dB_dstate_stride = dB.stride(2);
+    params.dC_batch_stride = dC.stride(0);
+    params.dC_group_stride = dC.stride(1);
+    params.dC_dstate_stride = dC.stride(2);
     params.du_batch_stride = du.stride(0);
     params.du_d_stride = du.stride(1);
     params.ddelta_batch_stride = ddelta.stride(0);
@@ -232,12 +213,9 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
     TORCH_CHECK(weight_type == at::ScalarType::Float);
 
-    const bool is_variable_B = B.dim() >= 3;
-    const bool is_variable_C = C.dim() >= 3;
-
     TORCH_CHECK(delta.scalar_type() == input_type);
-    TORCH_CHECK(B.scalar_type() == (!is_variable_B ? weight_type : input_type));
-    TORCH_CHECK(C.scalar_type() == (!is_variable_C ? weight_type : input_type));
+    TORCH_CHECK(B.scalar_type() == input_type);
+    TORCH_CHECK(C.scalar_type() == input_type);
 
     TORCH_CHECK(u.is_cuda());
     TORCH_CHECK(delta.is_cuda());
@@ -253,25 +231,17 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
     const int dim = sizes[1];
     const int seqlen = sizes[2];
     const int dstate = A.size(1);
-    const int n_groups = is_variable_B ? B.size(1) : 1;
+    const int n_groups = B.size(1);
 
     TORCH_CHECK(dstate <= 256, "selective_scan only supports state dimension <= 256");
 
     CHECK_SHAPE(u, batch_size, dim, seqlen);
     CHECK_SHAPE(delta, batch_size, dim, seqlen);
     CHECK_SHAPE(A, dim, dstate);
-    if (!is_variable_B) {
-        CHECK_SHAPE(B, dim, dstate);
-    } else {
-        CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen);
-        TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
-    }
-    if (!is_variable_C) {
-        CHECK_SHAPE(C, dim, dstate);
-    } else {
-        CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen);
-        TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
-    }
+    CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen);
+    TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
+    CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen);
+    TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
 
     if (D_.has_value()) {
         auto D = D_.value();
@@ -309,7 +279,7 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
     x = torch::empty({batch_size, dim, n_chunks, dstate * 2}, u.options().dtype(weight_type));
 
     SSMParamsBase params;
-    set_ssm_params_fwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
+    set_ssm_params_fwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, true, true,
                        u, delta, A, B, C, out, z, out_z,
                        D_.has_value() ? D_.value().data_ptr() : nullptr,
                        delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
@@ -348,12 +318,9 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
     TORCH_CHECK(weight_type == at::ScalarType::Float);
 
-    const bool is_variable_B = B.dim() >= 3;
-    const bool is_variable_C = C.dim() >= 3;
-
     TORCH_CHECK(delta.scalar_type() == input_type);
-    TORCH_CHECK(B.scalar_type() == (!is_variable_B ? weight_type : input_type));
-    TORCH_CHECK(C.scalar_type() == (!is_variable_C ? weight_type : input_type));
+    TORCH_CHECK(B.scalar_type() == input_type);
+    TORCH_CHECK(C.scalar_type() == input_type);
     TORCH_CHECK(dout.scalar_type() == input_type);
 
     TORCH_CHECK(u.is_cuda());
@@ -372,25 +339,17 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
     const int dim = sizes[1];
     const int seqlen = sizes[2];
     const int dstate = A.size(1);
-    const int n_groups = is_variable_B ? B.size(1) : 1;
+    const int n_groups = B.size(1);
 
     TORCH_CHECK(dstate <= 256, "selective_scan only supports state dimension <= 256");
 
     CHECK_SHAPE(u, batch_size, dim, seqlen);
     CHECK_SHAPE(delta, batch_size, dim, seqlen);
     CHECK_SHAPE(A, dim, dstate);
-    if (!is_variable_B) {
-        CHECK_SHAPE(B, dim, dstate);
-    } else {
-        CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen);
-        TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
-    }
-    if (!is_variable_C) {
-        CHECK_SHAPE(C, dim, dstate);
-    } else {
-        CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen);
-        TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
-    }
+    CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen);
+    TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
+    CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen);
+    TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
     CHECK_SHAPE(dout, batch_size, dim, seqlen);
 
     if (D_.has_value()) {
@@ -453,15 +412,15 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
     at::Tensor du = torch::empty_like(u);
     at::Tensor ddelta = torch::empty_like(delta);
     at::Tensor dA = torch::zeros_like(A);
-    at::Tensor dB = !is_variable_B ? torch::zeros_like(B) : torch::zeros_like(B, B.options().dtype(torch::kFloat32));
-    at::Tensor dC = !is_variable_C ? torch::zeros_like(C) : torch::zeros_like(C, C.options().dtype(torch::kFloat32));
+    at::Tensor dB = torch::zeros_like(B, B.options().dtype(torch::kFloat32));
+    at::Tensor dC = torch::zeros_like(C, C.options().dtype(torch::kFloat32));
     at::Tensor dD;
     if (D_.has_value()) { dD = torch::zeros_like(D_.value()); }
     at::Tensor ddelta_bias;
     if (delta_bias_.has_value()) { ddelta_bias = torch::zeros_like(delta_bias_.value()); }
 
     SSMParamsBwd params;
-    set_ssm_params_bwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
+    set_ssm_params_bwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, true, true,
                        u, delta, A, B, C, z, out, out_z,
                        D_.has_value() ? D_.value().data_ptr() : nullptr,
                        delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
