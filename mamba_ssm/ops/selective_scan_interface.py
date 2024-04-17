@@ -84,7 +84,7 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
 
 
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                      return_last_state=False):
+                      return_last_state=False, x = None):
     """
     u: r(B D L)
     delta: r(B D L)
@@ -116,7 +116,9 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     else:
         B = B.float()
         C = C.float()
-    x = A.new_zeros((batch, dim, dstate))
+    if x == None:
+        x = A.new_zeros((batch, dim, dstate))
+
     ys = []
     deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
     if not is_variable_B:
