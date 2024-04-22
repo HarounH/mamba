@@ -64,6 +64,7 @@ struct SSMParamsBase {
     void *__restrict__ x_ptr;
     void *__restrict__ z_ptr;
     void *__restrict__ out_z_ptr;
+    void *__restrict__ last_state_ptr;
 };
 
 struct SSMParamsBwd: public SSMParamsBase {

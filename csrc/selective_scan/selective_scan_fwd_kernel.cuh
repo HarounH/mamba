@@ -102,6 +102,10 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + batch_id * params.C_batch_stride + group_id * params.C_group_stride;
     scan_t *x = reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id * kNRows) * params.n_chunks * params.dstate;
 
+    scan_t *last_state = nullptr;
+    if (params.last_state_ptr != nullptr) {
+        last_state = reinterpret_cast<scan_t *>(params.last_state_ptr) + (batch_id * params.dim + dim_id * kNRows) * params.dstate;
+    }
     float D_val[kNRows] = {0};
     if (params.D_ptr != nullptr) {
         #pragma unroll
@@ -192,6 +196,10 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 scan_t running_prefix;
                 // If we use WARP_SCAN then all lane 0 of all warps (not just thread 0) needs to read
                 running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float2(1.f, 0.f);
+                // Initialize the state with the last state
+                if (chunk == 0 && threadIdx.x % 32 == 0 && last_state != nullptr){
+                   running_prefix = last_state[state_idx];
+                }
                 // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float2(1.f, 0.f);
                 SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
                 Ktraits::BlockScanT(smem_scan).InclusiveScan(

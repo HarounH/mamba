@@ -76,7 +76,8 @@ void set_ssm_params_fwd(SSMParamsBase &params,
                         void* delta_bias_ptr,
                         void* x_ptr,
                         bool has_z,
-                        bool delta_softplus) {
+                        bool delta_softplus,
+                        void* last_state_ptr) {
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -103,6 +104,8 @@ void set_ssm_params_fwd(SSMParamsBase &params,
     params.x_ptr = x_ptr;
     params.z_ptr = has_z ? z.data_ptr() : nullptr;
     params.out_z_ptr = has_z ? out_z.data_ptr() : nullptr;
+    params.last_state_ptr = last_state_ptr;
+
     // All stride are in elements, not bytes.
     params.A_d_stride = A.stride(0);
     params.A_dstate_stride = A.stride(1);
@@ -167,7 +170,7 @@ void set_ssm_params_bwd(SSMParamsBwd &params,
                        // If not recompute_out_z, pass dout instead of out_z.
                        // This won't be used by the bwd kernel
                        recompute_out_z ? out_z : dout,
-                       D_ptr, delta_bias_ptr, x_ptr, has_z, delta_softplus);
+                       D_ptr, delta_bias_ptr, x_ptr, has_z, delta_softplus, nullptr);
     if (!recompute_out_z) { params.out_z_ptr = nullptr; }
 
     // Set the pointers and strides.
@@ -207,7 +210,8 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
                   const c10::optional<at::Tensor> &D_,
                   const c10::optional<at::Tensor> &z_,
                   const c10::optional<at::Tensor> &delta_bias_,
-                  bool delta_softplus) {
+                  bool delta_softplus,
+                  const c10::optional<at::Tensor> &last_state) {
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
@@ -285,7 +289,8 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
                        delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
                        x.data_ptr(),
                        has_z,
-                       delta_softplus);
+                       delta_softplus,
+                       last_state.has_value() ? last_state.value().data_ptr() : nullptr);
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
