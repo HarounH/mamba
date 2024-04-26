@@ -97,4 +97,5 @@ struct SSMParamsBwd: public SSMParamsBase {
     void *__restrict__ dz_ptr;
     void *__restrict__ ddelta_ptr;
     void *__restrict__ ddelta_bias_ptr;
+    void *__restrict__ last_running_postfix_ptr;
 };

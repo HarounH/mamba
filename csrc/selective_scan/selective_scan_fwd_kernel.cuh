@@ -200,6 +200,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 if (chunk == 0 && threadIdx.x % 32 == 0 && last_state != nullptr){
                    running_prefix = last_state[state_idx];
                 }
+                __syncthreads();
                 // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float2(1.f, 0.f);
                 SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
                 Ktraits::BlockScanT(smem_scan).InclusiveScan(

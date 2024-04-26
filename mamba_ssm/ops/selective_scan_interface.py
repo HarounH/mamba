@@ -3,6 +3,7 @@
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import custom_bwd, custom_fwd
+import torch.distributed as dist
 
 from einops import rearrange, repeat
 
@@ -15,7 +16,7 @@ class SelectiveScanFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                return_last_state=False, x=None):
+                return_last_state=False, ls=None, seq_parallel=False):
         if u.stride(-1) != 1:
             u = u.contiguous()
         if delta.stride(-1) != 1:
@@ -35,10 +36,12 @@ class SelectiveScanFn(torch.autograd.Function):
             C = rearrange(C, "b dstate l -> b 1 dstate l")
             ctx.squeeze_C = True
         print("Entering selective_scan_cuda")
-        out, x, *rest = selective_scan_cuda.fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus, x)
+        out, x, *rest = selective_scan_cuda.fwd(u, delta, A, B, C, D, z, delta_bias, ls, delta_softplus)
         ctx.delta_softplus = delta_softplus
+        ctx.seq_parallel = seq_parallel
         ctx.has_z = z is not None
-        last_state = x[:, :, -1, 1::2]  # (batch, dim, dstate)
+        last_state = x[:, :, -1, :]  # (batch, dim, dstate*2)
+        #last_state = x[:, :, -1, 1::2]  # (batch, dim, dstate)
         if not ctx.has_z:
             ctx.save_for_backward(u, delta, A, B, C, D, delta_bias, x)
             return out if not return_last_state else (out, last_state)
@@ -60,10 +63,44 @@ class SelectiveScanFn(torch.autograd.Function):
         # The kernel supports passing in a pre-allocated dz (e.g., in case we want to fuse the
         # backward of selective_scan_cuda with the backward of chunk).
         # Here we just pass in None and dz will be allocated in the C++ code.
-        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(
-            u, delta, A, B, C, D, z, delta_bias, dout, x, out, None, ctx.delta_softplus,
-            False  # option to recompute out_z, not used here
-        )
+        if ctx.seq_parallel:
+            #with torch.no_grad():
+            last_state = x[:, :, -1, :]
+            print("seq_parallel HERE: ", dist.get_rank())
+            running_postfix = torch.zeros_like(last_state).to(u.get_device())
+            #running_postfix = torch.zeros(1, self.d_model, self.d_state).to(u.get_device())
+            if dist.get_rank() == dist.get_world_size()-1:
+                du, ddelta, dA, dB, dC, dD, ddelta_bias, running_postfix, *rest = selective_scan_cuda.bwd(
+                    u, delta, A, B, C, D, z, delta_bias, dout, x, out, None,
+                    last_state, running_postfix,
+                    ctx.delta_softplus, False,  # option to recompute out_z, not used here
+                )
+                #pass the running_postfix to the prev rank
+                if dist.get_world_size() > 1 and dist.get_rank() != 0:
+                    dist.send(tensor=running_postfix.contiguous(), dst=dist.get_world_size()-1)
+            else:
+                print("HERE2: ", dist.get_rank())
+                #recv the state
+                if dist.get_world_size() > 1 and dist.get_rank() != dist.get_world_size()-1:
+                    print("HERE3: ", dist.get_rank())
+                    dist.recv(tensor=running_postfix, src=dist.get_rank()+1)
+                du, ddelta, dA, dB, dC, dD, ddelta_bias, running_postfix, *rest = selective_scan_cuda.bwd(
+                    u, delta, A, B, C, D, z, delta_bias, dout, x, out, None,
+                    last_state, running_postfix,
+                    ctx.delta_softplus, False,  # option to recompute out_z, not used here
+                )
+                #pass the state to the prev
+                if dist.get_world_size() > 1:
+                    dist.send(tensor=running_postfix.contiguous(), dst=dist.get_world_size()-1)
+        else:
+            print("NOT SEQ parallel HERE: ", dist.get_rank())
+            du, ddelta, dA, dB, dC, dD, ddelta_bias, running_postfix, *rest = selective_scan_cuda.bwd(
+                u, delta, A, B, C, D, z, delta_bias, dout, x, out, None,
+                None, None,
+                ctx.delta_softplus, False,  # option to recompute out_z, not used here
+            )
+
+
         dz = rest[0] if ctx.has_z else None
         dB = dB.squeeze(1) if getattr(ctx, "squeeze_B", False) else dB
         dC = dC.squeeze(1) if getattr(ctx, "squeeze_C", False) else dC
@@ -76,15 +113,15 @@ class SelectiveScanFn(torch.autograd.Function):
 
 
 def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                     return_last_state=False, x = None):
+                     return_last_state=False, x=None, seq_parallel=False):
     """if return_last_state is True, returns (out, last_state)
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
     """
-    if x == None:
-        return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+    if seq_parallel:
+        return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state, x, seq_parallel)
     else:
-        return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state, x)
+        return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
 
 
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,

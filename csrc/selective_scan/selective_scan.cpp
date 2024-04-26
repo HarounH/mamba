@@ -75,9 +75,9 @@ void set_ssm_params_fwd(SSMParamsBase &params,
                         void* D_ptr,
                         void* delta_bias_ptr,
                         void* x_ptr,
+                        void* last_state_ptr,
                         bool has_z,
-                        bool delta_softplus,
-                        void* last_state_ptr) {
+                        bool delta_softplus) {
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -160,6 +160,8 @@ void set_ssm_params_bwd(SSMParamsBwd &params,
                         const at::Tensor dz,
                         void* dD_ptr,
                         void* ddelta_bias_ptr,
+                        void* last_state_ptr,
+                        void* last_running_postfix_ptr,
                         bool has_z,
                         bool delta_softplus,
                         bool recompute_out_z) {
@@ -170,7 +172,7 @@ void set_ssm_params_bwd(SSMParamsBwd &params,
                        // If not recompute_out_z, pass dout instead of out_z.
                        // This won't be used by the bwd kernel
                        recompute_out_z ? out_z : dout,
-                       D_ptr, delta_bias_ptr, x_ptr, has_z, delta_softplus, nullptr);
+                       D_ptr, delta_bias_ptr, x_ptr, last_state_ptr, has_z, delta_softplus);
     if (!recompute_out_z) { params.out_z_ptr = nullptr; }
 
     // Set the pointers and strides.
@@ -202,6 +204,7 @@ void set_ssm_params_bwd(SSMParamsBwd &params,
         params.dz_batch_stride = dz.stride(0);
         params.dz_d_stride = dz.stride(1);
     }
+    params.last_running_postfix_ptr = last_running_postfix_ptr;
 }
 
 std::vector<at::Tensor>
@@ -210,8 +213,8 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
                   const c10::optional<at::Tensor> &D_,
                   const c10::optional<at::Tensor> &z_,
                   const c10::optional<at::Tensor> &delta_bias_,
-                  bool delta_softplus,
-                  const c10::optional<at::Tensor> &last_state) {
+                  const c10::optional<at::Tensor> &last_state,
+                  bool delta_softplus) {
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
@@ -288,9 +291,9 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
                        D_.has_value() ? D_.value().data_ptr() : nullptr,
                        delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
                        x.data_ptr(),
+                       last_state.has_value() ? last_state.value().data_ptr() : nullptr,
                        has_z,
-                       delta_softplus,
-                       last_state.has_value() ? last_state.value().data_ptr() : nullptr);
+                       delta_softplus);
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
@@ -301,8 +304,9 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
             selective_scan_fwd_cuda<input_t, weight_t>(params, stream);
         });
     });
-    std::vector<at::Tensor> result = {out, x};
+    std::vector<at::Tensor> result = {out};
     if (has_z) { result.push_back(out_z); }
+    result.push_back(x);
     return result;
 }
 
@@ -316,6 +320,8 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
                   const c10::optional<at::Tensor> &x_,
                   const c10::optional<at::Tensor> &out_,
                   c10::optional<at::Tensor> &dz_,
+                  c10::optional<at::Tensor> &last_state_,
+                  c10::optional<at::Tensor> &running_postfix_,
                   bool delta_softplus,
                   bool recompute_out_z) {
     auto input_type = u.scalar_type();
@@ -423,7 +429,11 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
     if (D_.has_value()) { dD = torch::zeros_like(D_.value()); }
     at::Tensor ddelta_bias;
     if (delta_bias_.has_value()) { ddelta_bias = torch::zeros_like(delta_bias_.value()); }
-
+    
+    if (!running_postfix_.has_value()) {
+        running_postfix_ = std::optional<at::Tensor>{torch::empty({batch_size, dim, n_chunks, dstate * 2}, u.options().dtype(weight_type))};
+    }
+     
     SSMParamsBwd params;
     set_ssm_params_bwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, true, true,
                        u, delta, A, B, C, z, out, out_z,
@@ -433,6 +443,8 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
                        dout, du, ddelta, dA, dB, dC, dz,
                        D_.has_value() ? dD.data_ptr() : nullptr,
                        delta_bias_.has_value() ? ddelta_bias.data_ptr() : nullptr,
+                       last_state_.has_value() ? last_state_.value().data_ptr() : nullptr,
+                       running_postfix_.has_value() ? running_postfix_.value().data_ptr() : nullptr,
                        has_z, delta_softplus, recompute_out_z);
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -447,6 +459,7 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
     std::vector<at::Tensor> result = {du, ddelta, dA, dB.to(B.dtype()), dC.to(C.dtype()), dD, ddelta_bias};
     if (has_z) { result.push_back(dz); }
     if (recompute_out_z) { result.push_back(out_z); }
+    result.push_back(running_postfix_.value());
     return result;
 }
 

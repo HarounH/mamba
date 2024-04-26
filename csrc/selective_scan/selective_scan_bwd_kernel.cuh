@@ -127,6 +127,12 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
         : reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id) * (params.n_chunks) * params.dstate;
     float dD_val = 0;
     float ddelta_bias_val = 0;
+    scan_t *last_state = params.last_state_ptr == nullptr
+        ? nullptr
+        : reinterpret_cast<scan_t *>(params.last_state_ptr) + (batch_id * params.dim + dim_id) * params.dstate;
+    scan_t *last_running_postfix = params.last_running_postfix_ptr == nullptr
+        ? nullptr
+        : reinterpret_cast<scan_t *>(params.last_running_postfix_ptr) + (batch_id * params.dim + dim_id) * params.dstate;
 
     constexpr int kChunkSize = kNThreads * kNItems;
     u += (params.n_chunks - 1) * kChunkSize;
@@ -237,16 +243,23 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                 : smem_delta_a[threadIdx.x + 1 + 2 * MAX_DSTATE];
             // Initialize running total
             scan_t running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? x[(chunk - 1) * params.dstate + state_idx] : make_float2(1.f, 0.f);
+            if (chunk == 0 && threadIdx.x % 32 == 0 && last_state != nullptr) {
+                running_prefix = last_state[state_idx];
+            }
             SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
             Ktraits::BlockScanT(smem_scan).InclusiveScan(
                 thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
             );
             scan_t running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? smem_running_postfix[state_idx] : make_float2(1.f, 0.f);
+            if (chunk == 0 && threadIdx.x % 32 == 0 && last_running_postfix != nullptr) {
+                running_postfix  = last_running_postfix[state_idx];
+            }
             SSMScanPrefixCallbackOp<weight_t> postfix_op(running_postfix);
             Ktraits::BlockReverseScanT(smem_reverse_scan).InclusiveReverseScan(
                 thread_reverse_data, thread_reverse_data, SSMScanOp<weight_t>(), postfix_op
             );
             if (threadIdx.x == 0) { smem_running_postfix[state_idx] = postfix_op.running_prefix; }
+            if (threadIdx.x == 0) { last_running_postfix[state_idx] = postfix_op.running_prefix; }
             weight_t dA_val = 0, dBC_val = 0;
             weight_t dB_vals[kNItems], dC_vals[kNItems];
             #pragma unroll
