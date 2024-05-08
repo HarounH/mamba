@@ -69,6 +69,7 @@ class SelectiveScanFn(torch.autograd.Function):
             print("seq_parallel HERE: ", dist.get_rank())
             running_postfix = torch.zeros_like(last_state).to(u.get_device())
             #running_postfix = torch.zeros(1, self.d_model, self.d_state).to(u.get_device())
+            # if last rank
             if dist.get_rank() == dist.get_world_size()-1:
                 du, ddelta, dA, dB, dC, dD, ddelta_bias, running_postfix, *rest = selective_scan_cuda.bwd(
                     u, delta, A, B, C, D, z, delta_bias, dout, x, out, None,
@@ -79,18 +80,16 @@ class SelectiveScanFn(torch.autograd.Function):
                 if dist.get_world_size() > 1 and dist.get_rank() != 0:
                     dist.send(tensor=running_postfix.contiguous(), dst=dist.get_world_size()-1)
             else:
-                print("HERE2: ", dist.get_rank())
                 #recv the state
-                if dist.get_world_size() > 1 and dist.get_rank() != dist.get_world_size()-1:
-                    print("HERE3: ", dist.get_rank())
+                if dist.get_world_size() > 1:
                     dist.recv(tensor=running_postfix, src=dist.get_rank()+1)
                 du, ddelta, dA, dB, dC, dD, ddelta_bias, running_postfix, *rest = selective_scan_cuda.bwd(
                     u, delta, A, B, C, D, z, delta_bias, dout, x, out, None,
                     last_state, running_postfix,
                     ctx.delta_softplus, False,  # option to recompute out_z, not used here
                 )
-                #pass the state to the prev
-                if dist.get_world_size() > 1:
+                #pass the state to the prev, if not first rank
+                if dist.get_world_size() > 1 and dist.get_rank() !=0:
                     dist.send(tensor=running_postfix.contiguous(), dst=dist.get_world_size()-1)
         else:
             print("NOT SEQ parallel HERE: ", dist.get_rank())
@@ -157,8 +156,12 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     else:
         B = B.float()
         C = C.float()
-    if x == None:
+    if x != None:
+        print(x.flatten()[0:3])
+    if x is None:
         x = A.new_zeros((batch, dim, dstate))
+    if x != None:
+        print(x.flatten()[0:3])
 
     ys = []
     deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
@@ -183,7 +186,8 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
             else:
                 y = torch.einsum('bdn,bdn->bd', x, C[:, :, :, i])
         if i == u.shape[2] - 1:
-            last_state = x
+            print("Cloning x")
+            last_state = x.clone()
         if y.is_complex():
             y = y.real * 2
         ys.append(y)
@@ -192,7 +196,7 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     if z is not None:
         out = out * F.silu(z)
     out = out.to(dtype=dtype_in)
-    return out if not return_last_state else (out, last_state)
+    return out if not return_last_state else (out, last_state, deltaA, deltaB_u)
 
 
 class MambaInnerFn(torch.autograd.Function):
